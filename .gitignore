@@ -1,0 +1,23 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local config & secrets
+.env
+.env.*
+
+# Data & artifacts (keep repo lean)
+data/logs/
+data/processed/
+data/gold/
+*.jsonl
+*.jsonl.gz
+*.parquet
+reports/
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
