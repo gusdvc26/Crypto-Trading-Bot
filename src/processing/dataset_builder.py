@@ -91,10 +91,8 @@ def _load_jsonl(path: Path) -> List[dict]:
     return recs
 
 def _normalize_sv(sv: str, keep_full: bool) -> str:
-    if keep_full:
-        return sv
-    # collapse to family prefix, e.g. "v1"
-    return sv.split("|", 1)[0] if sv else "v1"
+    # Preserve strategy_version exactly by default; keep_full flag is respected as a no-op.
+    return sv
 
 def _ensure_bool(series: pd.Series) -> pd.Series:
     # Convert a variety of possible encodings to bool
@@ -105,59 +103,47 @@ def _ensure_bool(series: pd.Series) -> pd.Series:
     # strings like "True"/"False" or "true"/"false" or "0"/"1"
     return series.fillna("False").astype(str).str.lower().isin(("true", "1", "t", "yes", "y"))
 
-def _merge_labels(
+def _merge_labels_asof(
     decisions: pd.DataFrame,
     labels: pd.DataFrame,
-    horizon_min: int,
-    time_tolerance_ms: int,
+    tol_ms: int,
 ) -> pd.DataFrame:
-    labels = labels.copy()
-    labels["t"] = pd.to_datetime(labels["t"], utc=False)
-    # Drop duplicate timestamps in labels (keep last)
-    labels = labels.sort_values("t").drop_duplicates(subset=["t"], keep="last")
+    """As-of tolerance join decisions to labels per symbol using UTC ms columns.
 
-    # Rename horizon-specific columns
-    ren = {}
-    for b in BOOL_COLS_BASE:
-        if b in labels.columns:
-            ren[b] = f"{b}_{horizon_min}m"
-    for b in FLOAT_COLS_BASE:
-        if b in labels.columns:
-            ren[b] = f"{b}_{horizon_min}m"
-    labels = labels.rename(columns=ren)
+    Expects decisions to have `ts_ms` and labels to have `decision_ts_ms` (both ms ints).
+    Falls back to using `t` if ms columns are missing.
+    """
+    dec = decisions.copy()
+    lab = labels.copy()
 
-    # Keep only columns we need
-    keep_cols = ["t"] + list(ren.values())
-    labels = labels[keep_cols]
+    # Determine ms columns with safe fallbacks
+    if "ts_ms" not in dec.columns and "t" in dec.columns:
+        dec["ts_ms"] = pd.to_numeric(dec["t"], errors="coerce")
+    if "decision_ts_ms" not in lab.columns and "t" in lab.columns:
+        lab["decision_ts_ms"] = pd.to_numeric(lab["t"], errors="coerce")
 
-    dec = decisions.sort_values("t").copy()
+    # Parse as UTC datetimes
+    dec["ts_ms_dt"] = pd.to_datetime(dec["ts_ms"], unit="ms", utc=True)
+    lab["decision_ts_ms_dt"] = pd.to_datetime(lab["decision_ts_ms"], unit="ms", utc=True)
 
-    if time_tolerance_ms > 0:
-        # nearest-merge with tolerance
-        merged = pd.merge_asof(
-            dec,
-            labels.sort_values("t"),
-            on="t",
-            direction="nearest",
-            tolerance=pd.to_timedelta(time_tolerance_ms, unit="ms"),
-        )
-    else:
-        merged = dec.merge(labels, on="t", how="left", validate="one_to_one")
+    # Ensure symbol present on both sides
+    if "symbol" not in dec.columns and "symbol" in lab.columns:
+        # broadcast from labels if needed (rare)
+        if lab["symbol"].nunique() == 1:
+            dec["symbol"] = lab["symbol"].iloc[0]
+    if "symbol" not in lab.columns and "symbol" in dec.columns:
+        lab["symbol"] = dec["symbol"]
 
-    # Coerce types
-    for b in BOOL_COLS_BASE:
-        col = f"{b}_{horizon_min}m"
-        if col in merged.columns:
-            merged[col] = _ensure_bool(merged[col])
-        else:
-            merged[col] = False
-
-    for b in FLOAT_COLS_BASE:
-        col = f"{b}_{horizon_min}m"
-        if col in merged.columns:
-            merged[col] = pd.to_numeric(merged[col], errors="coerce")
-        else:
-            merged[col] = pd.NA
+    # Merge as-of with tolerance by symbol
+    merged = pd.merge_asof(
+        dec.sort_values(["symbol", "ts_ms_dt"]).reset_index(drop=True),
+        lab.sort_values(["symbol", "decision_ts_ms_dt"]).reset_index(drop=True),
+        by="symbol",
+        left_on="ts_ms_dt",
+        right_on="decision_ts_ms_dt",
+        direction="nearest",
+        tolerance=pd.Timedelta(milliseconds=int(tol_ms)),
+    )
 
     return merged
 
@@ -168,7 +154,7 @@ def main():
 
     keep_full_sv = _env_bool("DATASET_KEEP_FULL_SV", False)
     log_info = _env_bool("DATASET_LOG_LEVEL", False) or os.getenv("DATASET_LOG_LEVEL", "").upper() == "INFO"
-    time_tol_ms = _env_int("DATASET_TIME_TOL_MS", 0)
+    time_tol_ms = _env_int("DATASET_TIME_TOL_MS", 2000)
 
     if args.symbols.upper() == "ALL":
         symbols = _list_symbols(root)
@@ -190,50 +176,88 @@ def main():
                 continue
             dec = pd.DataFrame(dec_recs)
 
-            # Sanity: required cols
-            if "t" not in dec.columns:
-                continue
-
-            dec["t"] = pd.to_datetime(dec["t"], utc=False)
-            # Respect strategy_version policy
-            sv_col = dec.get("strategy_version")
-            if sv_col is not None:
-                dec["strategy_version"] = dec["strategy_version"].astype(str).map(lambda s: _normalize_sv(s, keep_full_sv))
-            else:
+            # Ensure strategy_version present and preserved as-is
+            if "strategy_version" not in dec.columns:
                 dec["strategy_version"] = "v1"
+            else:
+                dec["strategy_version"] = dec["strategy_version"].astype(str)
 
             dec["symbol"] = sym
 
-            # Merge labels for each horizon
-            merged = dec
-            for h in HORIZONS_MIN:
-                lab_path = base / f"labels_{h}m.jsonl.gz"
-                lab_recs = _load_jsonl(lab_path)
-                if not lab_recs:
-                    # add empty columns for this horizon
+            # Load labels (preferred single-file) and merge with tolerance
+            lab_single = base / "labels.jsonl.gz"
+            if lab_single.exists():
+                lab_recs = _load_jsonl(lab_single)
+                labs = pd.DataFrame(lab_recs) if lab_recs else pd.DataFrame()
+                if not labs.empty:
+                    merged = _merge_labels_asof(dec, labs, tol_ms=time_tol_ms)
+                else:
+                    merged = dec.copy()
+            else:
+                # Fallback: horizon-specific files; maintain prior behavior with tolerance on 't'
+                merged = dec.copy()
+                if "t" in merged.columns:
+                    merged["t"] = pd.to_datetime(merged["t"], unit=None, utc=False, errors="coerce")
+                for h in HORIZONS_MIN:
+                    lab_path = base / f"labels_{h}m.jsonl.gz"
+                    lab_recs = _load_jsonl(lab_path)
+                    if not lab_recs:
+                        for b in BOOL_COLS_BASE:
+                            merged[f"{b}_{h}m"] = False
+                        for b in FLOAT_COLS_BASE:
+                            merged[f"{b}_{h}m"] = pd.NA
+                        if log_info:
+                            print(f"[INFO] {sym} {d}: NO labels_{h}m.jsonl.gz")
+                        continue
+                    labs = pd.DataFrame(lab_recs)
+                    if "t" not in labs.columns:
+                        for b in BOOL_COLS_BASE:
+                            merged[f"{b}_{h}m"] = False
+                        for b in FLOAT_COLS_BASE:
+                            merged[f"{b}_{h}m"] = pd.NA
+                        if log_info:
+                            print(f"[WARN] {sym} {d}: labels_{h}m.jsonl.gz missing 't' column")
+                        continue
+                    labs = labs.copy()
+                    labs["t"] = pd.to_datetime(labs["t"], utc=False, errors="coerce")
+                    # Rename horizon-specific columns
+                    ren = {}
                     for b in BOOL_COLS_BASE:
-                        merged[f"{b}_{h}m"] = False
+                        if b in labs.columns:
+                            ren[b] = f"{b}_{h}m"
                     for b in FLOAT_COLS_BASE:
-                        merged[f"{b}_{h}m"] = pd.NA
-                    if log_info:
-                        print(f"[INFO] {sym} {d}: NO labels_{h}m.jsonl.gz")
-                    continue
+                        if b in labs.columns:
+                            ren[b] = f"{b}_{h}m"
+                    labs = labs.rename(columns=ren)
+                    keep_cols = ["t"] + list(ren.values())
+                    labs = labs[keep_cols]
+                    merged = pd.merge_asof(
+                        merged.sort_values("t"),
+                        labs.sort_values("t"),
+                        on="t",
+                        direction="nearest",
+                        tolerance=pd.to_timedelta(time_tol_ms, unit="ms"),
+                    )
 
-                labs = pd.DataFrame(lab_recs)
-                if "t" not in labs.columns:
-                    # corrupt label file; make empty columns
+                # Type coercion for fallback path
+                for h in HORIZONS_MIN:
                     for b in BOOL_COLS_BASE:
-                        merged[f"{b}_{h}m"] = False
+                        col = f"{b}_{h}m"
+                        if col in merged.columns:
+                            merged[col] = _ensure_bool(merged[col])
+                        else:
+                            merged[col] = False
                     for b in FLOAT_COLS_BASE:
-                        merged[f"{b}_{h}m"] = pd.NA
-                    if log_info:
-                        print(f"[WARN] {sym} {d}: labels_{h}m.jsonl.gz missing 't' column")
-                    continue
+                        col = f"{b}_{h}m"
+                        if col in merged.columns:
+                            merged[col] = pd.to_numeric(merged[col], errors="coerce")
+                        else:
+                            merged[col] = pd.NA
 
-                merged = _merge_labels(merged, labs, horizon_min=h, time_tolerance_ms=time_tol_ms)
-
-            # Minimal cleanup
-            merged = merged.sort_values("t").reset_index(drop=True)
+            # Minimal cleanup: sort by decision time if available
+            sort_col = "ts_ms" if "ts_ms" in merged.columns else ("t" if "t" in merged.columns else None)
+            if sort_col is not None:
+                merged = merged.sort_values(sort_col).reset_index(drop=True)
             frames.append(merged)
 
             if log_info:
@@ -253,6 +277,14 @@ def main():
 
     # Report a quick summary in logs
     by_sv = df["strategy_version"].value_counts().head(10)
+    # QA and optional gate
+    mask_cols = [c for c in ["mask_1m", "mask_5m", "mask_15m"] if c in df.columns]
+    qa = {f"{c}_true_pct": float(df[c].mean()) if c in df.columns else None for c in mask_cols}
+    print("DATASET_QA", qa)
+    import sys as _sys
+    if os.getenv('ENFORCE_QA','0')=='1' and 'mask_5m' in df.columns and (df['mask_5m'].mean() < 0.30):
+        print("QA_GATE_FAIL: mask_5m < 30%"); _sys.exit(2)
+
     m5_true = int(df.get("mask_5m", pd.Series([False] * len(df))).astype(bool).sum())
     print(f"Wrote Parquet: {out_path.as_posix()}")
     print(f"Built dataset: {out_path.as_posix()} (rows={len(df)})")

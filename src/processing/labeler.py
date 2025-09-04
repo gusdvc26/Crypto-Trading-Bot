@@ -157,12 +157,23 @@ def _label_one(
     sl_bps: int,
 ) -> Dict[str, Any]:
     """Compute labels for a single decision row."""
+    # Decision timestamp (UTC ms) copied through for auditing/joins
+    # Prefer explicit `ts_ms`, fallback to numeric `t`, then ISO `ts`.
+    try:
+        decision_ts_ms = int(d.get("ts_ms", d.get("t")))  # type: ignore[arg-type]
+    except Exception:
+        try:
+            iso = d.get("ts")
+            decision_ts_ms = int(datetime.fromisoformat(str(iso).replace('Z','+00:00')).replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except Exception:
+            decision_ts_ms = int(d.get("t", 0))
     out: Dict[str, Any] = {
         "decision_id": d.get("decision_id"),
         "ts_label": datetime.now(timezone.utc).isoformat(),
         "exchange": d.get("exchange"),
         "symbol": d.get("symbol"),
         "t": int(d["t"]),
+        "decision_ts_ms": int(decision_ts_ms),
         "strategy": d.get("strategy"),
         "strategy_version": d.get("strategy_version"),
         "action": d.get("action"),
@@ -211,6 +222,8 @@ def _label_one(
 
         # Write fields
         key = f"{H}m"
+        # Auditing: window end timestamp for this horizon (UTC ms)
+        out[f"window_end_ts_{key}_ms"] = int(future_t)
         out[f"ret_{key}"] = ret_close
         out[f"d_ret_{key}"] = d_ret_close
         out[f"runup_{key}"] = runup

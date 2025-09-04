@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from config.settings import get_settings
-from src.utils.helpers import get_logger
+from src.utils.helpers import get_logger, now_utc_ms
 
 log = get_logger(__name__)
 S = get_settings()
@@ -98,9 +98,12 @@ async def persist_decision(
     decision_id = str(uuid.uuid4())
     date_str = datetime.utcfromtimestamp(t / 1000).strftime("%Y-%m-%d")
     path = _daily_path(S.persist.dir_ml, exchange, symbol, date_str, "decisions")
+    # Decision row: ensure `ts_ms` (UTC ms) and `symbol` present.
+    ts_ms_value = int(t) if isinstance(t, (int, float)) else now_utc_ms()
     payload: Dict[str, Any] = {
         "decision_id": decision_id,
         "ts": _ts_iso(),
+        "ts_ms": ts_ms_value,
         "t": t,
         "exchange": exchange,
         "symbol": symbol,

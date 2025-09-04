@@ -29,6 +29,27 @@ def ts_ms() -> int:
     return int(utc_now().timestamp() * 1000)
 
 
+# ---- New tiny helpers for UTC ms timestamps ----
+def now_utc_ms() -> int:
+    """Return current UTC epoch milliseconds as int.
+
+    Small helper used when recording decision timestamps.
+    """
+    return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+
+def to_utc_ms(x) -> int:
+    """Convert an ISO string or numeric ms to UTC epoch ms (int).
+
+    If ``x`` is already an int/float, it is returned as int(ms).
+    Otherwise, parse an ISO 8601 string (tolerates trailing 'Z') and return ms.
+    """
+    from datetime import datetime, timezone as _tz
+    if isinstance(x, (int, float)):
+        return int(x)
+    return int(datetime.fromisoformat(str(x).replace('Z', '+00:00')).replace(tzinfo=_tz.utc).timestamp() * 1000)
+
+
 # -----------------------
 # Logging setup
 # -----------------------
