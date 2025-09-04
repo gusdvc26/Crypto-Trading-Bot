@@ -1,0 +1,5 @@
+# Default asset universe configuration (flat keys only)
+symbols: [BTC-USD, ETH-USD]
+universe_max: 25
+refresh_ttl_s: 300
+min_24h_notional: 100000

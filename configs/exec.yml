@@ -1,0 +1,6 @@
+# Execution/runtime controls (flat keys only)
+gate_top_k: 3
+cooldown_s: 0
+sniper_window_s: 10
+sniper_history_bars: 60
+mover_scan_every_s: 60

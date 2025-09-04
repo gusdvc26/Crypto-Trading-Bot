@@ -7,7 +7,14 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from config.settings import get_settings
-from src.utils.helpers import get_logger, async_retry, TTLCache
+from src.utils.helpers import (
+    get_logger,
+    async_retry,
+    TTLCache,
+    TokenBucketLimiter,
+    GlobalLimiter,
+    backoff_delay,
+)
 
 log = get_logger(__name__)
 S = get_settings()
@@ -22,6 +29,13 @@ _cache = TTLCache(
     ttl_seconds=S.cache.ttl_seconds,
     max_items=S.cache.max_items,
 )
+
+# Global + per-key limiters
+_global_limiter = GlobalLimiter(max_in_flight=S.api.http_conn_limit)
+_symbol_limiter = TokenBucketLimiter(rate_per_sec=5.0, capacity=5)
+
+# Single-flight map for OHLCV requests
+_inflight: dict[tuple, asyncio.Task] = {}
 
 # ---------------------------------
 # SSL verify configuration (robust to bad env)
@@ -95,11 +109,42 @@ async def shutdown_session() -> None:
 
 
 @async_retry(attempts=S.api.http_retries, base_delay=S.api.http_backoff_base)
-async def _get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+async def _get_json(path: str, params: Optional[Dict[str, Any]] = None, symbol_key: Optional[str] = None) -> Any:
+    """GET JSON with limiter and 429-aware backoff.
+
+    Uses a global in-flight limiter and a per-symbol token bucket limiter.
+    On HTTP 429, honors Retry-After if present; otherwise sleeps on a jittered
+    exponential schedule up to configured retries (outer async_retry also applies).
+    """
     client = await _get_client()
-    resp = await client.get(path.lstrip("/"), params=params)
-    resp.raise_for_status()
-    return resp.json()
+    # Default to path as key if symbol missing
+    key = symbol_key or path
+
+    attempt = 0
+    while True:
+        attempt += 1
+        async with (await _global_limiter.acquire()):
+            async with (await _symbol_limiter.acquire(key)):
+                resp = await client.get(path.lstrip("/"), params=params)
+        try:
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 429:
+                # Respect Retry-After header if provided
+                ra = e.response.headers.get("Retry-After") if e.response is not None else None
+                if ra:
+                    try:
+                        wait_s = float(ra)
+                    except Exception:
+                        wait_s = backoff_delay(attempt, base=S.api.http_backoff_base)
+                else:
+                    wait_s = backoff_delay(attempt, base=S.api.http_backoff_base)
+                log.warning(f"HTTP 429 on {path}; sleeping {wait_s:.3f}s before retry.")
+                await asyncio.sleep(wait_s)
+                continue
+            raise
 
 
 # ---------------------------------
@@ -241,7 +286,22 @@ async def fetch_ohlcv(
                 return cached
 
         # GET /products/{product_id}/candles?granularity=seconds
-        raw = await _get_json(f"/products/{product_id}/candles", {"granularity": gran})
+        # Single-flight key
+        sf_key = ("ohlcv", "coinbase", product_id, gran, limit)
+        existing = _inflight.get(sf_key)
+        if existing is not None:
+            return await existing
+
+        async def _runner():
+            raw = await _get_json(f"/products/{product_id}/candles", {"granularity": gran}, symbol_key=product_id)
+            return _parse_coinbase_candles(raw)[-limit:]
+
+        task = asyncio.create_task(_runner())
+        _inflight[sf_key] = task
+        try:
+            parsed = await task
+        finally:
+            _inflight.pop(sf_key, None)
         parsed = _parse_coinbase_candles(raw)[-limit:]
 
         if use_cache and S.cache.enabled:
@@ -258,8 +318,21 @@ async def fetch_ohlcv(
                 return cached
 
         # GET /0/public/OHLC?pair=PAIR&interval=minutes
-        raw = await _get_json("/0/public/OHLC", {"pair": pair, "interval": kint})
-        parsed = _parse_kraken_candles(raw)[-limit:]
+        sf_key = ("ohlcv", "kraken", pair, kint, limit)
+        existing = _inflight.get(sf_key)
+        if existing is not None:
+            return await existing
+
+        async def _runner_k():
+            raw = await _get_json("/0/public/OHLC", {"pair": pair, "interval": kint}, symbol_key=pair)
+            return _parse_kraken_candles(raw)[-limit:]
+
+        task = asyncio.create_task(_runner_k())
+        _inflight[sf_key] = task
+        try:
+            parsed = await task
+        finally:
+            _inflight.pop(sf_key, None)
 
         if use_cache and S.cache.enabled:
             await _cache.set(cache_key, parsed)
@@ -297,7 +370,7 @@ async def fetch_orderbook_top(symbol: str) -> Dict[str, Optional[float]]:
     if x == "coinbase":
         product_id = _norm_symbol_coinbase(symbol)
         # GET /products/{product_id}/book?level=1
-        raw = await _get_json(f"/products/{product_id}/book", {"level": 1})
+        raw = await _get_json(f"/products/{product_id}/book", {"level": 1}, symbol_key=product_id)
         bid = float(raw["bids"][0][0]) if raw.get("bids") else None
         ask = float(raw["asks"][0][0]) if raw.get("asks") else None
         return {"bid": bid, "ask": ask}
@@ -305,7 +378,7 @@ async def fetch_orderbook_top(symbol: str) -> Dict[str, Optional[float]]:
     elif x == "kraken":
         pair = _norm_symbol_kraken(symbol)
         # GET /0/public/Depth?pair=PAIR&count=5
-        raw = await _get_json("/0/public/Depth", {"pair": pair, "count": 5})
+        raw = await _get_json("/0/public/Depth", {"pair": pair, "count": 5}, symbol_key=pair)
         book = next(iter(raw.get("result", {}).values()), {})
         bids = book.get("bids") or []
         asks = book.get("asks") or []

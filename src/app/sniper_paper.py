@@ -5,7 +5,7 @@ import asyncio, os, logging
 from typing import Dict
 
 from config.settings import get_settings
-from src.utils.helpers import setup_logging, get_logger
+from src.utils.helpers import setup_logging, get_logger, load_config
 from src.universe.universe import select_universe, UniversePolicy
 from src.ingestion.ws_coinbase import coinbase_ticker_stream
 from src.processing.microbars import MicroBarAgg, RollingBars
@@ -40,11 +40,16 @@ async def main() -> int:
     log.info(f"Sniper (log-only) on {WINDOW_S}s bars booted")
 
     # Universe policy (stagger TTL from Movers to reduce REST bursts)
+    cfg_assets = {}
+    try:
+        cfg_assets = load_config('assets')
+    except Exception:
+        cfg_assets = {}
     pol = UniversePolicy(
-        max_symbols=int(os.getenv("UNIVERSE_MAX", "30")),
+        max_symbols=int(os.getenv("UNIVERSE_MAX", str(cfg_assets.get('universe_max', 30)))),
         movers_window_m=int(os.getenv("UNIVERSE_MOVERS_WINDOW", "5")),
-        refresh_ttl_s=int(os.getenv("UNIVERSE_REFRESH_TTL", "540")),
-        min_24h_notional=float(os.getenv("UNIVERSE_MIN_NOTIONAL", "300000")),
+        refresh_ttl_s=int(os.getenv("UNIVERSE_REFRESH_TTL", str(cfg_assets.get('refresh_ttl_s', 540)))),
+        min_24h_notional=float(os.getenv("UNIVERSE_MIN_NOTIONAL", str(cfg_assets.get('min_24h_notional', 300000)))),
         # exclude=("BTC-USD","ETH-USD","SOL-USD"),
     )
     symbols = await select_universe(pol)
@@ -57,8 +62,13 @@ async def main() -> int:
         require_trend=bool(int(os.getenv("MOVER_REQUIRE_TREND", "0"))),
     )
 
-    agg  = MicroBarAgg(window_ms=WINDOW_S * 1000)
-    hist = RollingBars(maxlen=HISTORY_BARS)
+    cfg_exec = {}
+    try:
+        cfg_exec = load_config('exec')
+    except Exception:
+        cfg_exec = {}
+    agg  = MicroBarAgg(window_ms=int(os.getenv("SNIPER_BAR_SECONDS", str(cfg_exec.get('sniper_window_s', WINDOW_S)))) * 1000)
+    hist = RollingBars(maxlen=int(os.getenv("SNIPER_HISTORY_BARS", str(cfg_exec.get('sniper_history_bars', HISTORY_BARS)))))
 
     try:
         async for tick in coinbase_ticker_stream(symbols):

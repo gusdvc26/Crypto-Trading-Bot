@@ -7,7 +7,7 @@ from typing import List, Tuple, Dict, Any
 import httpx
 
 from config.settings import get_settings
-from src.utils.helpers import setup_logging, get_logger
+from src.utils.helpers import setup_logging, get_logger, load_config
 from src.ingestion.fetch_data import fetch_ohlcv
 from src.universe.universe import select_universe, UniversePolicy
 from src.utils.persist import persist_ohlcv_row, persist_decision
@@ -111,17 +111,27 @@ async def main() -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     log.info("Mover watcher booted")
 
+    cfg_assets = {}
+    try:
+        cfg_assets = load_config('assets')
+    except Exception:
+        cfg_assets = {}
     pol = UniversePolicy(
-        max_symbols=int(os.getenv("UNIVERSE_MAX", "25")),
+        max_symbols=int(os.getenv("UNIVERSE_MAX", str(cfg_assets.get('universe_max', 25)))),
         movers_window_m=int(os.getenv("UNIVERSE_MOVERS_WINDOW", "5")),
-        refresh_ttl_s=int(os.getenv("UNIVERSE_REFRESH_TTL", "300")),
-        min_24h_notional=float(os.getenv("UNIVERSE_MIN_NOTIONAL", "100000")),
+        refresh_ttl_s=int(os.getenv("UNIVERSE_REFRESH_TTL", str(cfg_assets.get('refresh_ttl_s', 300)))),
+        min_24h_notional=float(os.getenv("UNIVERSE_MIN_NOTIONAL", str(cfg_assets.get('min_24h_notional', 100000)))),
         # exclude=("BTC-USD","ETH-USD","SOL-USD"),
     )
+    cfg_risk = {}
+    try:
+        cfg_risk = load_config('risk')
+    except Exception:
+        cfg_risk = {}
     strat = MoversV1(
-        thresh=float(os.getenv("MOVER_THRESH", "0.010")),
-        require_trend=bool(int(os.getenv("MOVER_REQUIRE_TREND", "0"))),
-        min_atr_bps=float(os.getenv("MOVER_MIN_ATR_BPS", "5")),
+        thresh=float(os.getenv("MOVER_THRESH", str(cfg_risk.get('mover_thresh', 0.010)))),
+        require_trend=bool(int(os.getenv("MOVER_REQUIRE_TREND", str(int(bool(cfg_risk.get('require_trend', 0))))))),
+        min_atr_bps=float(os.getenv("MOVER_MIN_ATR_BPS", str(cfg_risk.get('mover_min_atr_bps', 5)))),
     )
 
     interval, exchange = s.default_interval, s.api.exchange

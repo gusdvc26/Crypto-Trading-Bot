@@ -1,0 +1,6 @@
+# Default risk and labeling thresholds (flat keys only)
+tp_bps: 20
+sl_bps: 20
+mover_thresh: 0.010
+mover_min_atr_bps: 5
+require_trend: 0
